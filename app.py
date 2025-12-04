@@ -1,6 +1,7 @@
 import os
 import json
 import numpy as np
+import pandas as pd
 import joblib
 from PIL import Image
 
@@ -20,7 +21,6 @@ try:
 except Exception:
     feedparser = None
 
-
 # ==============================
 # Page config
 # ==============================
@@ -33,7 +33,6 @@ st.set_page_config(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
 # ==============================
 # Load model, tokenizer, config
 # ==============================
@@ -43,18 +42,18 @@ def load_all():
     tok_path = os.path.join(BASE_DIR, "tokenizer.pkl")
     cfg_path = os.path.join(BASE_DIR, "model_config.json")
 
-    # Load model (CPU-only, compile disabled for speed/compat)
+    # Load CNN model (CPU only, compile disabled for safety)
     model = load_model(model_path, compile=False)
 
     tokenizer = joblib.load(tok_path)
     with open(cfg_path, "r") as f:
         cfg = json.load(f)
 
-    return model, tokenizer, cfg["max_len"]
+    max_len = cfg.get("max_len", 200)
+    return model, tokenizer, max_len
 
 
 model, tokenizer, max_len = load_all()
-
 
 # ==============================
 # Helper functions
@@ -65,12 +64,13 @@ def preprocess_text(text: str):
 
 
 def predict_news(text: str):
+    """Return label, confidence (for predicted class), and raw prob(fake)."""
     padded = preprocess_text(text)
-    prob = float(model.predict(padded)[0][0])
-    is_fake = prob > 0.5
+    prob_fake = float(model.predict(padded, verbose=0)[0][0])
+    is_fake = prob_fake > 0.5
     label = "FAKE News" if is_fake else "REAL News"
-    confidence = prob if is_fake else 1 - prob
-    return label, confidence, prob
+    confidence = prob_fake if is_fake else 1 - prob_fake
+    return label, confidence, prob_fake, is_fake
 
 
 def extract_article(url: str):
@@ -123,77 +123,129 @@ def get_trending_items():
         }
     ]
 
-
 # ==============================
-# EXPLANATION: word-level contributions
+# CUSTOM EXPLANATION ENGINE
+# (occlusion-based, premium UI)
 # ==============================
-
-def explain_prediction(text: str):
+def compute_token_importances(text: str, base_prob_fake: float, is_fake: bool, max_words: int = 60):
     """
-    Occlusion-style explanation:
-    For each word, remove it and see how much the model's target
-    probability changes. That change = importance score.
-    Positive score -> pushes towards the predicted label.
-    Negative score -> pushes against it.
+    For each word, remove it and see how the predicted probability
+    for the predicted class changes.
+    Positive score = pushes towards the predicted label.
+    Negative score = pushes against the predicted label.
     """
     words = text.split()
-    if len(words) < 3:
+    if not words:
         return []
 
-    # Base prediction
-    base_padded = preprocess_text(text)
-    base_prob = float(model.predict(base_padded)[0][0])
-    is_fake = base_prob > 0.5
-    base_target = base_prob if is_fake else (1 - base_prob)
+    # Limit words for speed
+    words = words[:max_words]
+    base_class_score = base_prob_fake if is_fake else (1.0 - base_prob_fake)
 
     scores = []
-    for i in range(len(words)):
-        tmp_words = words[:i] + words[i + 1:]
-        if not tmp_words:
+    for idx, w in enumerate(words):
+        occluded = " ".join(words[:idx] + words[idx + 1:])
+        if not occluded.strip():
             continue
-        tmp_text = " ".join(tmp_words)
-        padded = preprocess_text(tmp_text)
-        prob = float(model.predict(padded)[0][0])
-        tmp_target = prob if is_fake else (1 - prob)
-        importance = base_target - tmp_target
-        scores.append((words[i], importance))
+        padded = preprocess_text(occluded)
+        prob_fake_occ = float(model.predict(padded, verbose=0)[0][0])
+        class_score_occ = prob_fake_occ if is_fake else (1.0 - prob_fake_occ)
+        impact = base_class_score - class_score_occ
+        scores.append((w, impact))
 
+    # Sort by absolute impact
+    scores.sort(key=lambda x: abs(x[1]), reverse=True)
+    return scores
+
+
+def render_explanation(text: str, base_prob_fake: float, is_fake: bool):
+    scores = compute_token_importances(text, base_prob_fake, is_fake)
     if not scores:
-        return []
-
-    # Normalize for nicer display
-    max_abs = max(abs(s) for _, s in scores) or 1.0
-    norm_scores = [(w, s / max_abs) for w, s in scores]
-    return norm_scores
-
-
-def display_explanation(text: str):
-    scores = explain_prediction(text)
-    if not scores:
-        st.info("Not enough text for explanation. Try a longer headline or paragraph.")
+        st.info("Not enough text to generate an explanation.")
         return
 
-    st.subheader("🔍 Word-level explanation")
+    # Take top 12 for display
+    top_scores = scores[:12]
+    words = [w for w, s in top_scores]
+    vals = [float(s) for _, s in top_scores]
 
-    # Show top 10 strongest contributors
-    top = sorted(scores, key=lambda x: abs(x[1]), reverse=True)[:10]
-    st.markdown("**Top influential words for this prediction:**")
-    for w, s in top:
-        direction = "⬆️ pushes towards this label" if s >= 0 else "⬇️ pushes away from this label"
-        st.write(f"- **{w}** — contribution: {s:+.2f}  ({direction})")
+    # Summary bullets
+    st.markdown("### 🧠 Deep Explanation")
+    if is_fake:
+        st.write(
+            "The model is **more confident this is FAKE** when certain words are present. "
+            "Words with higher positive impact push the prediction towards FAKE."
+        )
+    else:
+        st.write(
+            "The model is **more confident this is REAL** when certain words are present. "
+            "Words with higher positive impact push the prediction towards REAL."
+        )
 
-    # Highlight full text
-    st.markdown("**Highlighted text (green = supporting, red = opposing):**")
+    # --- Bar chart (top influential words) ---
+    df = pd.DataFrame(
+        {"word": words, "importance": vals}
+    ).set_index("word")
 
-    html = ""
-    for w, s in scores:
-        if s >= 0:
-            color = "#bbf7d0"  # light green
+    st.markdown("#### 🔝 Most influential words")
+    st.bar_chart(df)
+
+    # --- Highlighted text chips ---
+    st.markdown("#### 🎨 Highlighted sentence")
+
+    all_words = text.split()
+    # Build a quick lookup dict
+    impact_map = {w: s for w, s in scores}
+
+    if impact_map:
+        max_abs = max(abs(v) for v in impact_map.values()) + 1e-8
+    else:
+        max_abs = 1.0
+
+    def word_to_span(w):
+        raw_score = impact_map.get(w, 0.0)
+        norm = raw_score / max_abs
+
+        # Positive = supports predicted class
+        if norm > 0:
+            if is_fake:
+                base_color = "#f97373"  # reddish for fake
+            else:
+                base_color = "#4ade80"  # green for real
         else:
-            color = "#fecaca"  # light red
-        html += f"<span style='background-color:{color}; padding:2px 5px; margin:1px; border-radius:4px;'>{w}</span> "
+            # Opposes predicted class = faded blue/grey
+            base_color = "#e5e7eb"
 
-    st.markdown(html, unsafe_allow_html=True)
+        intensity = min(0.8, 0.2 + abs(norm))  # 0.2–0.8
+        bg = base_color
+        opacity = intensity
+
+        style = (
+            f"display:inline-block; padding:2px 6px; margin:2px; "
+            f"border-radius:999px; background-color:{bg}; "
+            f"opacity:{opacity}; font-size:14px;"
+        )
+        score_str = f"{raw_score:+.3f}"
+        return f"<span style='{style}'>{w} ({score_str})</span>"
+
+    chips_html = " ".join(word_to_span(w) for w in all_words)
+    st.markdown(chips_html, unsafe_allow_html=True)
+
+    # --- Textual reason summary ---
+    st.markdown("#### 📝 Key drivers")
+    strong = [w for w, s in top_scores if s > 0]
+    against = [w for w, s in top_scores if s < 0]
+
+    if strong:
+        st.write(
+            "- Main words **supporting** this prediction: "
+            + ", ".join(f"`{w}`" for w in strong[:6])
+        )
+    if against:
+        st.write(
+            "- Words that **pull in the opposite direction**: "
+            + ", ".join(f"`{w}`" for w in against[:6])
+        )
 
 
 # ==============================
@@ -287,7 +339,6 @@ def inject_css(theme: str):
         unsafe_allow_html=True
     )
 
-
 # ==============================
 # Sidebar
 # ==============================
@@ -304,7 +355,6 @@ input_type = st.sidebar.radio(
 st.sidebar.markdown("### 📰 Trending fact-checks")
 for item in get_trending_items():
     st.sidebar.markdown(f"- [{item['title']}]({item['link']})")
-
 
 # ==============================
 # Logo + Title
@@ -334,7 +384,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # ==============================
 # Main content card
 # ==============================
@@ -348,15 +397,14 @@ with st.container():
             "News text",
             placeholder="Type or paste a news headline or short article here...",
             height=200,
-            label_visibility="collapsed"  # hides label, fixes accessibility warning
+            label_visibility="collapsed",
         )
 
         if st.button("Analyze Text"):
             if not user_text.strip():
                 st.warning("Please enter some text first.")
             else:
-                label, conf, raw_prob = predict_news(user_text)
-                is_fake = "FAKE" in label
+                label, conf, prob_fake, is_fake = predict_news(user_text)
                 emoji = "🔴" if is_fake else "🟢"
 
                 st.markdown("<div class='result-box'>", unsafe_allow_html=True)
@@ -376,9 +424,8 @@ with st.container():
                 """
                 st.markdown(bar_html, unsafe_allow_html=True)
 
-                # Word-level explanation
-                with st.expander("🔍 Why did the model predict this?"):
-                    display_explanation(user_text)
+                with st.expander("🔍 Why did the model predict this? (advanced explanation)"):
+                    render_explanation(user_text, prob_fake, is_fake)
 
                 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -412,8 +459,7 @@ with st.container():
                         with st.expander("📄 Show full article text"):
                             st.write(article_text)
 
-                        label, conf, raw_prob = predict_news(article_text)
-                        is_fake = "FAKE" in label
+                        label, conf, prob_fake, is_fake = predict_news(article_text)
                         emoji = "🔴" if is_fake else "🟢"
 
                         st.markdown("<div class='result-box'>", unsafe_allow_html=True)
@@ -433,9 +479,8 @@ with st.container():
                         """
                         st.markdown(bar_html, unsafe_allow_html=True)
 
-                        # Word-level explanation for full article
-                        with st.expander("🔍 Why did the model predict this?"):
-                            display_explanation(article_text)
+                        with st.expander("🔍 Why did the model predict this? (advanced explanation)"):
+                            render_explanation(article_text, prob_fake, is_fake)
 
                         st.markdown("</div>", unsafe_allow_html=True)
 
