@@ -40,7 +40,7 @@ https://fake-news-detection-app-adptswkkruuf4keteyadn6.streamlit.app
 **Model Used**
 - Logistic Regression + TF-IDF
 
-**Why this version exists**
+**Why this version**
 - Cloud platforms do not reliably support TensorFlow-based CNN models
 - This version is lightweight, fast, and stable for public access
 
