@@ -1,11 +1,11 @@
-
 # Fake News Detector 
-
 
 import streamlit as st
 import pickle
 import re
 import numpy as np
+from pathlib import Path
+import os
 
 # PAGE CONFIG
 
@@ -75,11 +75,58 @@ st.markdown("""
 
 @st.cache_resource
 def load_model_and_vectorizer():
-    with open("tfidf_vectorizer.pkl", "rb") as f:
-        tfidf = pickle.load(f)
-    with open("log_reg.pkl", "rb") as f:
-        logreg = pickle.load(f)
-    return tfidf, logreg
+    """
+    Robust loader that checks:
+      - file next to this script (preferred)
+      - fallback to current working directory
+    If not found, displays a helpful Streamlit error listing checked paths and files present.
+    """
+    base_dir = Path(__file__).resolve().parent
+    tfidf_path = base_dir / "tfidf_vectorizer.pkl"
+    logreg_path = base_dir / "log_reg.pkl"
+
+    alt_tfidf = Path.cwd() / "tfidf_vectorizer.pkl"
+    alt_logreg = Path.cwd() / "log_reg.pkl"
+
+    # Try preferred location (script folder)
+    if tfidf_path.exists() and logreg_path.exists():
+        with open(tfidf_path, "rb") as f:
+            tfidf = pickle.load(f)
+        with open(logreg_path, "rb") as f:
+            logreg = pickle.load(f)
+        return tfidf, logreg
+
+    # Try current working directory
+    if alt_tfidf.exists() and alt_logreg.exists():
+        with open(alt_tfidf, "rb") as f:
+            tfidf = pickle.load(f)
+        with open(alt_logreg, "rb") as f:
+            logreg = pickle.load(f)
+        return tfidf, logreg
+
+    # If we get here, files not found — produce helpful diagnostics
+    try:
+        base_files = sorted([p.name for p in base_dir.iterdir()])
+    except Exception:
+        base_files = "N/A"
+
+    msg = (
+        "Model files not found. Checked the following locations:\n\n"
+        f" - {tfidf_path}\n"
+        f" - {logreg_path}\n"
+        f" - {alt_tfidf}\n"
+        f" - {alt_logreg}\n\n"
+        f"Current working directory: {Path.cwd()}\n"
+        f"Files in script directory ({base_dir}): {base_files}\n\n"
+        "Common causes:\n"
+        "- The .pkl files are not committed to the repo or are on a different branch.\n"
+        "- Files were committed with Git LFS but LFS isn't enabled in the deploy environment.\n"
+        "- Filename/case mismatch (Linux is case-sensitive).\n"
+        "- The app is executed from a different folder on the cloud host.\n"
+    )
+    st.error(msg)
+    st.stop()
+
 
 tfidf, logreg = load_model_and_vectorizer()
 
